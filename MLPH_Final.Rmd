@@ -1,0 +1,308 @@
+---
+title: "MLPH_Final"
+output: pdf_document
+---
+
+
+```{r}
+install.packages(c(
+  "tidyverse",
+  "caret",
+  "corrplot",
+  "randomForest",
+  "xgboost",
+  "e1071",
+  "nnet",
+  "pROC",
+  "reshape2"
+))
+
+library(tidyverse)
+library(caret)
+library(ggplot2)
+library(corrplot)
+library(randomForest)
+library(xgboost)
+library(e1071)
+library(nnet)
+library(pROC)
+library(reshape2)
+library(psych)
+```
+
+```{r}
+df <- read.csv("fetal_health.csv")
+colSums(is.na(df))
+glimpse(df)
+summary(df$fetal_health)
+```
+
+```{r}
+df$fetal_health <- factor(df$fetal_health, levels = c(1, 2, 3),
+                          labels = c("Normal", "Suspect", "Pathological"))
+
+ggplot(df, aes(x = fetal_health)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Class Distribution of Fetal Health",
+       x = "Fetal Health Category", y = "Count")
+```
+
+```{r}
+summary(df)
+```
+
+```{r}
+describe(df)
+```
+
+```{r}
+predictor_data <- df %>% select(-fetal_health)
+
+#library(corrplot)
+corr_matrix <- cor(predictor_data)
+corrplot(corr_matrix, method = "color", type = "upper", tl.cex = 0.7,
+         title = "Correlation Matrix of Predictors", mar = c(0, 0, 2, 0))
+```
+
+```{r}
+library(caret)
+set.seed(123)
+train_index <- createDataPartition(df$fetal_health, p = 0.8, list = FALSE)
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+drop_vars <- c("histogram_median", "histogram_mode", "histogram_min", "histogram_max",
+               "histogram_number_of_zeroes", "histogram_number_of_peaks")
+train <- train %>% select(-all_of(drop_vars))
+test  <- test %>% select(-all_of(drop_vars))
+```
+
+```{r}
+preproc <- preProcess(train %>% select(-fetal_health), method = c("center", "scale"))
+train_scaled <- predict(preproc, train %>% select(-fetal_health))
+test_scaled  <- predict(preproc, test %>% select(-fetal_health))
+
+train_final <- data.frame(train_scaled, fetal_health = train$fetal_health)
+test_final  <- data.frame(test_scaled, fetal_health = test$fetal_health)
+
+glimpse(train_final)
+
+```
+
+```{r}
+library(randomForest)
+set.seed(123)
+rf_model <- randomForest(fetal_health ~ ., data = train_final, importance = TRUE)
+varImpPlot(rf_model, main = "RF Variable Importance", ps = 3)
+```
+
+```{r}
+selected_vars <- c(
+  "abnormal_short_term_variability",
+  "percentage_of_time_with_abnormal_long_term_variability",
+  "histogram_mean",
+  "mean_value_of_short_term_variability",
+  "prolongued_decelerations",
+  "mean_value_of_long_term_variability",
+  "baseline.value",
+  "histogram_width",
+  "histogram_variance",
+  "accelerations",
+  "fetal_health"
+)
+train_final <- train_final %>% select(all_of(selected_vars))
+test_final  <- test_final %>% select(all_of(selected_vars))
+
+library(caret)
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 10)
+logit_cv_model <- train(
+  fetal_health ~ .,
+  data = train_final,
+  method = "multinom",
+  trControl = ctrl,
+  trace = FALSE
+)
+
+logit_cv_model
+```
+
+```{r}
+logit_cv_model$results
+```
+
+```{r}
+cv_preds <- predict(logit_cv_model, newdata = test_final)
+confusionMatrix(cv_preds, test_final$fetal_health)
+```
+
+```{r}
+library(randomForest)
+set.seed(123)
+rf_model <- randomForest(fetal_health ~ .,
+                         data = train_final,
+                         ntree = 500,  
+                         mtry = 3,      
+                         importance = TRUE)
+print(rf_model)
+```
+
+```{r}
+rf_preds <- predict(rf_model, newdata = test_final)
+confusionMatrix(rf_preds, test_final$fetal_health)
+```
+
+```{r}
+varImpPlot(rf_model, main = "Random Forest Variable Importance")
+```
+
+```{r}
+#install.packages("glmnet")
+library(glmnet)
+x_train <- model.matrix(fetal_health ~ . - 1, data = train_final)
+y_train <- train_final$fetal_health
+x_test <- model.matrix(fetal_health ~ . - 1, data = test_final)
+y_test <- test_final$fetal_health
+
+set.seed(123)
+cv_lasso <- cv.glmnet(
+  x_train,
+  y_train,
+  family = "multinomial",
+  alpha = 1,            
+  type.measure = "class"
+)
+plot(cv_lasso)
+```
+
+```{r}
+cv_lasso$lambda.min
+```
+
+```{r}
+lasso_model <- glmnet(
+  x_train,
+  y_train,
+  family = "multinomial",
+  alpha = 1,
+  lambda = cv_lasso$lambda.min
+)
+lasso_preds <- predict(lasso_model, newx = x_test, type = "class")
+confusionMatrix(as.factor(lasso_preds), y_test)
+```
+
+```{r}
+library(knitr)
+library(dplyr)
+model_results <- tibble(
+  Model = c("Logistic Regression (CV)", "Random Forest", "Lasso Regression (CV)"),
+  Accuracy = c(0.906, 0.946, 0.899),
+  Kappa = c(0.75, 0.85, 0.73),
+  `Normal BA` = c(0.886, 0.921, 0.879),
+  `Suspect BA` = c(0.846, 0.895, 0.846),
+  `Pathological BA` = c(0.910, 0.969, 0.878)
+)
+kable(model_results, digits = 3, caption = "Comparison of Model Performance Metrics")
+```
+
+```{r}
+library(gt)
+model_results %>%
+  gt() %>%
+  tab_header(
+    title = "Model Comparison: Fetal Health Classification"
+  ) %>%
+  fmt_number(
+    columns = c(Accuracy, Kappa, `Normal BA`, `Suspect BA`, `Pathological BA`),
+    decimals = 3
+  ) %>%
+  cols_label(
+    Accuracy = "Accuracy",
+    Kappa = "Kappa",
+    `Normal BA` = "Normal (BA)",
+    `Suspect BA` = "Suspect (BA)",
+    `Pathological BA` = "Pathological (BA)"
+  ) %>%
+  tab_options(
+    table.font.size = "small"
+  )
+```
+
+```{r}
+library(caret)
+library(ggplot2)
+library(reshape2)
+rf_conf <- confusionMatrix(rf_preds, test_final$fetal_health)
+cm_df <- as.data.frame(rf_conf$table)
+ggplot(cm_df, aes(Prediction, Reference)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  geom_text(aes(label = Freq), size = 5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix: Random Forest", fill = "Count") +
+  theme_minimal()
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+cv_results <- data.frame(
+  lambda = cv_lasso$lambda,
+  cvm = cv_lasso$cvm,
+  cvsd = cv_lasso$cvsd
+)
+cv_results <- cv_results %>%
+  mutate(
+    log_lambda = log(lambda),
+    lambda_min = ifelse(lambda == cv_lasso$lambda.min, "min", "other")
+  )
+ggplot(cv_results, aes(x = log_lambda, y = cvm)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(aes(color = lambda_min), size = 2) +
+  geom_errorbar(aes(ymin = cvm - cvsd, ymax = cvm + cvsd), width = 0.05) +
+  geom_vline(xintercept = log(cv_lasso$lambda.min), linetype = "dashed", color = "red") +
+  labs(
+    title = "Cross-Validation Error vs log(Lambda)",
+    x = "log(Lambda)",
+    y = "Mean CV Classification Error",
+    color = "Lambda"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("min" = "red", "other" = "gray"))
+```
+
+```{r}
+logit_probs <- predict(logit_cv_model, newdata = test_final, type = "prob")
+rf_probs <- predict(rf_model, newdata = test_final, type = "prob")
+#lasso_probs <- predict(lasso_model, newx = x_test, type = "response")
+lasso_probs_mat <- drop(predict(lasso_model, newx = x_test, type = "response"))
+y_test_bin <- model.matrix(~ y_test - 1)
+
+logit_auc <- sapply(1:3, function(i) {
+  roc(y_test_bin[, i], logit_probs[, i])$auc
+})
+rf_auc <- sapply(1:3, function(i) {
+  roc(y_test_bin[, i], rf_probs[, i])$auc
+})
+lasso_auc <- sapply(1:3, function(i) {
+  roc(y_test_bin[, i], lasso_probs_mat[, i])$auc
+})
+
+
+logit_mean_auc <- mean(logit_auc)
+rf_mean_auc <- mean(rf_auc)
+lasso_mean_auc <- mean(lasso_auc)
+
+logit_mean_auc
+rf_mean_auc
+lasso_mean_auc
+```
+
+```{r}
+logit_gini <- 2 * logit_mean_auc - 1
+rf_gini <- 2 * rf_mean_auc - 1
+lasso_gini <- 2 * lasso_mean_auc - 1
+
+logit_gini
+rf_gini
+lasso_gini
+```
